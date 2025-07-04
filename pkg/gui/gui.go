@@ -2,6 +2,7 @@ package gui
 
 import (
 	goContext "context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -118,7 +119,7 @@ type Gui struct {
 	// is being pushed). At the moment the rule is to use an item operation when
 	// we need to talk to the remote.
 	itemOperations      map[string]types.ItemOperation
-	itemOperationsMutex *deadlock.Mutex
+	itemOperationsMutex deadlock.Mutex
 
 	PrevLayout PrevLayout
 
@@ -348,13 +349,8 @@ func (gui *Gui) onNewRepo(startArgs appTypes.StartArgs, contextKey types.Context
 			}
 
 			gui.c.Log.Info("Receiving focus - refreshing")
-			refreshErr := gui.helpers.Refresh.Refresh(types.RefreshOptions{Mode: types.ASYNC})
-			if reloadErr != nil {
-				// An error from reloading the config is the more important one
-				// to report to the user
-				return reloadErr
-			}
-			return refreshErr
+			gui.helpers.Refresh.Refresh(types.RefreshOptions{Mode: types.ASYNC})
+			return reloadErr
 		}
 
 		return nil
@@ -523,6 +519,13 @@ func (gui *Gui) checkForChangedConfigsThatDontAutoReload(oldConfig *config.UserC
 // resetState reuses the repo state from our repo state map, if the repo was
 // open before; otherwise it creates a new one.
 func (gui *Gui) resetState(startArgs appTypes.StartArgs) types.Context {
+	// Un-highlight the current view if there is one. The reason we do this is
+	// that the repo we are switching to might have a different view focused,
+	// and would then show an inactive highlight for the previous view.
+	if oldCurrentView := gui.g.CurrentView(); oldCurrentView != nil {
+		oldCurrentView.Highlight = false
+	}
+
 	worktreePath := gui.git.RepoPaths.WorktreePath()
 
 	if state := gui.RepoStateMap[Repo(worktreePath)]; state != nil {
@@ -579,8 +582,8 @@ func (gui *Gui) resetState(startArgs appTypes.StartArgs) types.Context {
 	return initialContext(contextTree, startArgs)
 }
 
-func (self *Gui) getViewBufferManagerForView(view *gocui.View) *tasks.ViewBufferManager {
-	manager, ok := self.viewBufferManagerMap[view.Name()]
+func (gui *Gui) getViewBufferManagerForView(view *gocui.View) *tasks.ViewBufferManager {
+	manager, ok := gui.viewBufferManagerMap[view.Name()]
 	if !ok {
 		return nil
 	}
@@ -603,9 +606,9 @@ func initialScreenMode(startArgs appTypes.StartArgs, config config.AppConfigurer
 		return parseScreenModeArg(startArgs.ScreenMode)
 	} else if startArgs.FilterPath != "" || startArgs.GitArg != appTypes.GitArgNone {
 		return types.SCREEN_HALF
-	} else {
-		return parseScreenModeArg(config.GetUserConfig().Gui.ScreenMode)
 	}
+
+	return parseScreenModeArg(config.GetUserConfig().Gui.ScreenMode)
 }
 
 func parseScreenModeArg(screenModeArg string) types.ScreenMode {
@@ -674,22 +677,10 @@ func NewGui(
 		// real value after loading the user config:
 		ShowExtrasWindow: true,
 
-		Mutexes: types.Mutexes{
-			RefreshingFilesMutex:    &deadlock.Mutex{},
-			RefreshingBranchesMutex: &deadlock.Mutex{},
-			RefreshingStatusMutex:   &deadlock.Mutex{},
-			LocalCommitsMutex:       &deadlock.Mutex{},
-			SubCommitsMutex:         &deadlock.Mutex{},
-			AuthorsMutex:            &deadlock.Mutex{},
-			SubprocessMutex:         &deadlock.Mutex{},
-			PopupMutex:              &deadlock.Mutex{},
-			PtyMutex:                &deadlock.Mutex{},
-		},
 		InitialDir:       initialDir,
 		afterLayoutFuncs: make(chan func() error, 1000),
 
-		itemOperations:      make(map[string]types.ItemOperation),
-		itemOperationsMutex: &deadlock.Mutex{},
+		itemOperations: make(map[string]types.ItemOperation),
 	}
 
 	gui.PopupHandler = popup.NewPopupHandler(
@@ -697,7 +688,7 @@ func NewGui(
 		func(ctx goContext.Context, opts types.CreatePopupPanelOpts) {
 			gui.helpers.Confirmation.CreatePopupPanel(ctx, opts)
 		},
-		func() error { return gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC}) },
+		func() error { gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC}); return nil },
 		func() { gui.State.ContextMgr.Pop() },
 		func() types.Context { return gui.State.ContextMgr.Current() },
 		gui.createMenu,
@@ -877,8 +868,7 @@ func (gui *Gui) RunAndHandleError(startArgs appTypes.StartArgs) error {
 
 			close(gui.stopChan)
 
-			switch err {
-			case gocui.ErrQuit:
+			if errors.Is(err, gocui.ErrQuit) {
 				if gui.c.State().GetRetainOriginalDir() {
 					if err := gui.helpers.RecordDirectory.RecordDirectory(gui.InitialDir); err != nil {
 						return err
@@ -890,10 +880,9 @@ func (gui *Gui) RunAndHandleError(startArgs appTypes.StartArgs) error {
 				}
 
 				return nil
-
-			default:
-				return err
 			}
+
+			return err
 		}
 
 		return nil
@@ -938,9 +927,7 @@ func (gui *Gui) runSubprocessWithSuspenseAndRefresh(subprocess *oscommands.CmdOb
 		return err
 	}
 
-	if err := gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC}); err != nil {
-		return err
-	}
+	gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
 
 	return nil
 }
@@ -970,7 +957,7 @@ func (gui *Gui) runSubprocessWithSuspense(subprocess *oscommands.CmdObj) (bool, 
 	return true, nil
 }
 
-func (gui *Gui) runSubprocess(cmdObj *oscommands.CmdObj) error { //nolint:unparam
+func (gui *Gui) runSubprocess(cmdObj *oscommands.CmdObj) error {
 	gui.LogCommand(cmdObj.ToString(), true)
 
 	subprocess := cmdObj.GetCmd()
@@ -1002,9 +989,7 @@ func (gui *Gui) loadNewRepo() error {
 		return err
 	}
 
-	if err := gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC}); err != nil {
-		return err
-	}
+	gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
 
 	if err := gui.os.UpdateWindowTitle(); err != nil {
 		return err

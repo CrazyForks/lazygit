@@ -468,6 +468,11 @@
           "description": "If true, capture mouse events.\nWhen mouse events are captured, it's a little harder to select text: e.g. requiring you to hold the option key when on macOS.",
           "default": true
         },
+        "skipAmendWarning": {
+          "type": "boolean",
+          "description": "If true, do not show a warning when amending a commit.",
+          "default": false
+        },
         "skipDiscardChangeWarning": {
           "type": "boolean",
           "description": "If true, do not show a warning when discarding changes in the staging view.",
@@ -524,6 +529,11 @@
           "type": "boolean",
           "description": "If true, wrap lines in the staging view to the width of the view. This\nmakes it much easier to work with diffs that have long lines, e.g.\nparagraphs of markdown text.",
           "default": true
+        },
+        "useHunkModeInStagingView": {
+          "type": "boolean",
+          "description": "If true, hunk selection mode will be enabled by default when entering the staging view.",
+          "default": false
         },
         "language": {
           "type": "string",
@@ -680,9 +690,10 @@
             "single",
             "double",
             "rounded",
-            "hidden"
+            "hidden",
+            "bold"
           ],
-          "description": "Window border style.\nOne of 'rounded' (default) | 'single' | 'double' | 'hidden'",
+          "description": "Window border style.\nOne of 'rounded' (default) | 'single' | 'double' | 'hidden' | 'bold'",
           "default": "rounded"
         },
         "animateExplosion": {
