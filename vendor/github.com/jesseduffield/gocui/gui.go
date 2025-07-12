@@ -21,6 +21,8 @@ import (
 // are used.
 type OutputMode int
 
+const DOUBLE_CLICK_THRESHOLD = 500 * time.Millisecond
+
 var (
 	// ErrAlreadyBlacklisted is returned when the keybinding is already blacklisted.
 	ErrAlreadyBlacklisted = standardErrors.New("keybind already blacklisted")
@@ -95,6 +97,10 @@ type ViewMouseBinding struct {
 type ViewMouseBindingOpts struct {
 	X int // i.e. origin x + cursor x
 	Y int // i.e. origin y + cursor y
+
+	Key Key // which button was clicked (will be one of the Mouse* constants)
+
+	IsDoubleClick bool // true if this is a double click
 }
 
 type GuiMutexes struct {
@@ -116,6 +122,14 @@ type RecordingConfig struct {
 	Leeway int
 }
 
+type clickInfo struct {
+	x        int
+	y        int
+	key      Key
+	viewName string
+	time     time.Time
+}
+
 // Gui represents the whole User Interface, including the views, layouts
 // and keybindings.
 type Gui struct {
@@ -126,6 +140,7 @@ type Gui struct {
 
 	tabClickBindings  []*tabClickBinding
 	viewMouseBindings []*ViewMouseBinding
+	lastClick         *clickInfo
 	gEvents           chan GocuiEvent
 	userEvents        chan userEvent
 	views             []*View
@@ -786,7 +801,7 @@ func (g *Gui) MainLoop() error {
 }
 
 func (g *Gui) handleError(err error) error {
-	if err != nil && !IsQuit(err) && g.ErrorHandler != nil {
+	if err != nil && !standardErrors.Is(err, ErrQuit) && g.ErrorHandler != nil {
 		return g.ErrorHandler(err)
 	}
 
@@ -1385,7 +1400,8 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 		}
 
 		if IsMouseKey(ev.Key) {
-			opts := ViewMouseBindingOpts{X: newX, Y: newY}
+			isDoubleClick := g.recordClickInfo(newX, newY, ev.Key, v)
+			opts := ViewMouseBindingOpts{X: newX, Y: newY, Key: ev.Key, IsDoubleClick: isDoubleClick}
 			matched, err := g.execMouseKeybindings(v, ev, opts)
 			if err != nil {
 				return err
@@ -1418,6 +1434,32 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 	return nil
 }
 
+// remember the information for this click, and return true if it was a double click
+func (g *Gui) recordClickInfo(x, y int, key Key, v *View) bool {
+	if IsMouseScrollKey(key) {
+		g.lastClick = nil
+		return false
+	}
+
+	clickInfo := &clickInfo{
+		x:        x,
+		y:        y,
+		key:      key,
+		viewName: v.Name(),
+		time:     time.Now(),
+	}
+
+	isDoubleClick := g.lastClick != nil &&
+		clickInfo.x == g.lastClick.x &&
+		clickInfo.y == g.lastClick.y &&
+		clickInfo.key == g.lastClick.key &&
+		clickInfo.viewName == g.lastClick.viewName &&
+		clickInfo.time.Before(g.lastClick.time.Add(DOUBLE_CLICK_THRESHOLD))
+
+	g.lastClick = clickInfo
+	return isDoubleClick
+}
+
 func (g *Gui) execMouseKeybindings(view *View, ev *GocuiEvent, opts ViewMouseBindingOpts) (bool, error) {
 	isMatch := func(binding *ViewMouseBinding) bool {
 		return binding.ViewName == view.Name() &&
@@ -1428,7 +1470,9 @@ func (g *Gui) execMouseKeybindings(view *View, ev *GocuiEvent, opts ViewMouseBin
 	// first pass looks for ones that match the focused view
 	for _, binding := range g.viewMouseBindings {
 		if isMatch(binding) && binding.FocusedView != "" && binding.FocusedView == g.currentView.Name() {
-			return true, binding.Handler(opts)
+			if err := binding.Handler(opts); !errors.Is(err, ErrKeybindingNotHandled) {
+				return true, err
+			}
 		}
 	}
 
@@ -1498,6 +1542,8 @@ func (g *Gui) execKeybindings(v *View, ev *GocuiEvent) error {
 		}
 	}
 
+	var err error
+
 	for _, kb := range g.keybindings {
 		if kb.handler == nil {
 			continue
@@ -1506,13 +1552,13 @@ func (g *Gui) execKeybindings(v *View, ev *GocuiEvent) error {
 			continue
 		}
 		if g.matchView(v, kb) {
-			err := g.execKeybinding(v, kb)
-			if IsKeybindingNotHandled(err) {
-				matchingParentViewKb = nil
-				break
-			} else {
+			err = g.execKeybinding(v, kb)
+			if !errors.Is(err, ErrKeybindingNotHandled) {
 				return err
 			}
+
+			matchingParentViewKb = nil
+			break
 		}
 		if v != nil && g.matchView(v.ParentView, kb) {
 			matchingParentViewKb = kb
@@ -1522,8 +1568,8 @@ func (g *Gui) execKeybindings(v *View, ev *GocuiEvent) error {
 		}
 	}
 	if matchingParentViewKb != nil {
-		err := g.execKeybinding(v.ParentView, matchingParentViewKb)
-		if !IsKeybindingNotHandled(err) {
+		err = g.execKeybinding(v.ParentView, matchingParentViewKb)
+		if !errors.Is(err, ErrKeybindingNotHandled) {
 			return err
 		}
 	}
@@ -1536,9 +1582,9 @@ func (g *Gui) execKeybindings(v *View, ev *GocuiEvent) error {
 	}
 
 	if globalKb != nil {
-		return g.execKeybinding(v, globalKb)
+		err = g.execKeybinding(v, globalKb)
 	}
-	return nil
+	return err
 }
 
 // execKeybinding executes a given keybinding
@@ -1600,20 +1646,6 @@ func (g *Gui) isBlacklisted(k Key) bool {
 		}
 	}
 	return false
-}
-
-// IsUnknownView reports whether the contents of an error is "unknown view".
-func IsUnknownView(err error) bool {
-	return err != nil && err.Error() == ErrUnknownView.Error()
-}
-
-// IsQuit reports whether the contents of an error is "quit".
-func IsQuit(err error) bool {
-	return err != nil && err.Error() == ErrQuit.Error()
-}
-
-func IsKeybindingNotHandled(err error) bool {
-	return err != nil && err.Error() == ErrKeybindingNotHandled.Error()
 }
 
 func (g *Gui) Suspend() error {
